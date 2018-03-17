@@ -1,0 +1,17 @@
+bdev;bounds 1
+bdev;nbd_gpt 0
+bdev;bounds 1
+bdev;nbd_gpt 0
+bdev;bounds 2
+bdev;nbd_gpt 0
+bdev;bounds 3
+bdev;nbd_gpt 0
+bdev;bounds 0
+bdev;nbd_gpt 0
+bdev;bounds 1
+bdev;nbd_gpt 0
+bdev;bounds 0
+bdev;nbd_gpt 0
+bdev;bdev_svc 1
+bdev;nbd 1
+bdev -8

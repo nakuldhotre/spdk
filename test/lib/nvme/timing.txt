@@ -1,0 +1,11 @@
+nvme;identify 0
+nvme;perf 1
+nvme;reserve 1
+nvme;hello_world 0
+nvme;deallocated_value 0
+nvme;sgl 0
+nvme;e2edp 0
+nvme;overhead 1
+nvme;arbitration 4
+nvme;multi_secondary 3
+nvme 7

@@ -6,10 +6,10 @@ direct=1
 verify=0
 time_based=1
 ramp_time=0
-runtime=2
+runtime=60
 iodepth=128
 rw=randrw
-bs=4k
-
+bs=512
+filename=trtype=PCIe traddr=0000.00.0e.0 ns=1
 [test]
 numjobs=1

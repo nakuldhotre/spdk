@@ -240,6 +240,7 @@ bdev_nvme_destruct(void *ctx)
 {
 	struct nvme_bdev *nvme_disk = ctx;
 	struct nvme_ctrlr *nvme_ctrlr = nvme_disk->nvme_ctrlr;
+	printf("bdev_nvme_destruct\n");
 
 	pthread_mutex_lock(&g_bdev_nvme_mutex);
 	TAILQ_REMOVE(&g_nvme_bdevs, nvme_disk, link);

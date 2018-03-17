@@ -54,7 +54,7 @@ timing_enter bdev
 dd if=/dev/zero of=/tmp/aiofile bs=2048 count=5000
 
 cp $testdir/bdev.conf.in $testdir/bdev.conf
-$rootdir/scripts/gen_nvme.sh >> $testdir/bdev.conf
+# $rootdir/scripts/gen_nvme.sh >> $testdir/bdev.conf
 
 timing_enter bounds
 $testdir/bdevio/bdevio $testdir/bdev.conf

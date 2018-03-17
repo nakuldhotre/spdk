@@ -179,13 +179,14 @@ bdevperf_construct_targets(void)
 	size_t align;
 	int rc;
 
-	bdev = spdk_bdev_first_leaf();
-	while (bdev != NULL) {
+//	bdev = spdk_bdev_first_leaf();
+        bdev = spdk_bdev_get_by_name("Raid0");
+//	while (bdev != NULL) {
 
 		if (g_unmap && !spdk_bdev_io_type_supported(bdev, SPDK_BDEV_IO_TYPE_UNMAP)) {
 			printf("Skipping %s because it does not support unmap\n", spdk_bdev_get_name(bdev));
 			bdev = spdk_bdev_next_leaf(bdev);
-			continue;
+//			continue;
 		}
 
 		target = malloc(sizeof(struct io_target));
@@ -207,7 +208,7 @@ bdevperf_construct_targets(void)
 		if (rc != 0) {
 			SPDK_ERRLOG("Could not open leaf bdev %s, error=%d\n", spdk_bdev_get_name(bdev), rc);
 			bdev = spdk_bdev_next_leaf(bdev);
-			continue;
+//			continue;
 		}
 
 		target->bdev = bdev;
@@ -236,7 +237,7 @@ bdevperf_construct_targets(void)
 		g_target_count++;
 
 		bdev = spdk_bdev_next_leaf(bdev);
-	}
+//	}
 }
 
 static void
@@ -277,11 +278,20 @@ bdevperf_complete(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 			       task->offset_blocks, target->name);
 		}
 	} else if (g_verify || g_reset || g_unmap) {
+		int offset;
 		spdk_bdev_io_get_iovec(bdev_io, &iovs, &iovcnt);
 		assert(iovcnt == 1);
 		assert(iovs != NULL);
-		if (memcmp(task->buf, iovs[0].iov_base, g_io_size) != 0) {
-			printf("Buffer mismatch! Disk Offset: %lu\n", task->offset_blocks);
+		if ((offset = memcmp(task->buf, iovs[0].iov_base, g_io_size)) != 0) {
+			char *d1 = (char *)task->buf;
+			char *d2 = (char *)iovs[0].iov_base;
+			for (int i = 0; i < g_io_size; i++) {
+				if (d1[i] != d2[i]) {
+					printf("mismatch at %d\n", i);
+					break;
+				}
+			}
+			printf("Buffer mismatch! Disk Offset: %lu Buffset Offset %d\n", task->offset_blocks, offset);
 			target->is_draining = true;
 			g_run_failed = true;
 		}
@@ -583,8 +593,8 @@ performance_dump(uint64_t io_time_in_usec)
 					io_time_in_usec;
 			mb_per_second = io_per_second * g_io_size /
 					(1024 * 1024);
-			printf("\r %-20s: %10.2f IO/s %10.2f MB/s\n",
-			       target->name, io_per_second, mb_per_second);
+			printf("\r %-20s: %10.2f IO/s %10.2f MB/s NUM IOs %lu\n",
+			       target->name, io_per_second, mb_per_second, target->io_completed);
 			total_io_per_second += io_per_second;
 			total_mb_per_second += mb_per_second;
 			target = target->next;

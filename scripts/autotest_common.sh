@@ -49,7 +49,7 @@ config_params='--enable-debug --enable-werror'
 export UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1:abort_on_error=1'
 
 # Override the default HUGEMEM in scripts/setup.sh
-export HUGEMEM=8192
+export HUGEMEM=2048
 
 DEFAULT_RPC_ADDR=/var/tmp/spdk.sock
 

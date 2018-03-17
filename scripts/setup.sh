@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 set -e
-
+#set -x
 rootdir=$(readlink -f $(dirname $0))/..
 source "$rootdir/scripts/common.sh"
 
@@ -462,6 +462,7 @@ fi
 if [ `uname` = Linux ]; then
 	HUGEPGSZ=$(( `grep Hugepagesize /proc/meminfo | cut -d : -f 2 | tr -dc '0-9'` ))
 	HUGEPGSZ_MB=$(( $HUGEPGSZ / 1024 ))
+	echo "Huge mem $HUGEMEM"
 	: ${NRHUGE=$(( (HUGEMEM + HUGEPGSZ_MB - 1) / HUGEPGSZ_MB ))}
 
 	if [ "$mode" == "config" ]; then

@@ -110,10 +110,11 @@ bdevio_construct_targets(void)
 	struct io_target *target;
 	int rc;
 
-	printf("I/O targets:\n");
+	printf("I/O targets: list\n");
 
-	bdev = spdk_bdev_first_leaf();
-	while (bdev != NULL) {
+	bdev = spdk_bdev_get_by_name("Raid0");
+	if (!bdev) printf("%d", *(int *)NULL);
+//	while (bdev != NULL) {
 		uint64_t num_blocks = spdk_bdev_get_num_blocks(bdev);
 		uint32_t block_size = spdk_bdev_get_block_size(bdev);
 
@@ -125,9 +126,10 @@ bdevio_construct_targets(void)
 		rc = spdk_bdev_open(bdev, true, NULL, NULL, &target->bdev_desc);
 		if (rc != 0) {
 			free(target);
-			SPDK_ERRLOG("Could not open leaf bdev %s, error=%d\n", spdk_bdev_get_name(bdev), rc);
+			printf("Could not open leaf bdev %s, error=%d\n", spdk_bdev_get_name(bdev), rc);
 			bdev = spdk_bdev_next_leaf(bdev);
-			continue;
+			assert(0);
+			//continue;
 		}
 
 		printf("  %s: %" PRIu64 " blocks of %" PRIu32 " bytes (%" PRIu64 " MiB)\n",
@@ -141,7 +143,7 @@ bdevio_construct_targets(void)
 		g_io_targets = target;
 
 		bdev = spdk_bdev_next_leaf(bdev);
-	}
+//	}
 
 	return 0;
 }

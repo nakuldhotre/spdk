@@ -46,6 +46,7 @@
 #include "fio.h"
 #include "optgroup.h"
 
+static int thread_count = 0;
 struct spdk_fio_options {
 	void *pad;
 	char *conf;
@@ -183,11 +184,13 @@ spdk_fio_init_thread(struct thread_data *td)
 		return -1;
 	}
 
+	char th_name[16];
+	sprintf(th_name, "fio_thread%d", thread_count++);
 	fio_thread->thread = spdk_allocate_thread(spdk_fio_send_msg,
 			     spdk_fio_start_poller,
 			     spdk_fio_stop_poller,
 			     fio_thread,
-			     "fio_thread");
+			     th_name);
 	if (!fio_thread->thread) {
 		spdk_ring_free(fio_thread->ring);
 		free(fio_thread);
@@ -310,6 +313,7 @@ spdk_fio_setup(struct thread_data *td)
 
 	for_each_file(td, f, i) {
 		struct spdk_bdev *bdev;
+		printf("opening %s\n",f->file_name);
 
 		bdev = spdk_bdev_get_by_name(f->file_name);
 		if (!bdev) {
@@ -472,6 +476,8 @@ spdk_fio_completion_cb(struct spdk_bdev_io *bdev_io,
 	struct thread_data		*td = fio_req->td;
 	struct spdk_fio_thread		*fio_thread = td->io_ops_data;
 
+	//printf("completed io\n");
+
 	assert(fio_thread->iocq_count < fio_thread->iocq_size);
 	fio_req->io->error = success ? 0 : EIO;
 	fio_thread->iocq[fio_thread->iocq_count++] = fio_req->io;
@@ -485,6 +491,8 @@ spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 	int rc = 1;
 	struct spdk_fio_request	*fio_req = io_u->engine_data;
 	struct spdk_fio_target *target = io_u->file->engine_data;
+
+	//printf("queueing commands\n");
 
 	assert(fio_req->td == td);
 
