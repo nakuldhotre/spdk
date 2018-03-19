@@ -122,7 +122,7 @@ endif
 ifeq ($(CONFIG_DEBUG), y)
 COMMON_CFLAGS += -DDEBUG -O0 -fno-omit-frame-pointer
 else
-COMMON_CFLAGS += -DNDEBUG -O2
+COMMON_CFLAGS += -DNDEBUG -O2 -g
 # Enable _FORTIFY_SOURCE checks - these only work when optimizations are enabled.
 COMMON_CFLAGS += -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 endif

@@ -1,0 +1,3 @@
+autobuild;check_format 6
+autobuild;build_kmod 1
+autobuild;scanbuild_make 68

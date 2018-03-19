@@ -39,6 +39,7 @@
 struct spdk_bdev;
 
 struct spdk_bdev *create_raid_bdev(const char *name, uint64_t num_blocks, uint32_t block_size,
-		int raid_level, int num_drives, const char **drives);
+		int raid_level, int num_drives, const char **drives,
+		int num_faults, int *faulty_drives);
 
 #endif /* SPDK_BDEV_NULL_H */

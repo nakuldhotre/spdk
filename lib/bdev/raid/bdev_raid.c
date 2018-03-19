@@ -49,6 +49,7 @@
 // erasure code
 #include <isa-l/raid.h>
 #include <isa-l/crc.h>
+#include <isa-l/erasure_code.h>
 SPDK_DECLARE_BDEV_MODULE(raid);
 
 #define RAID_DRIVES_MAX (8)
@@ -62,14 +63,32 @@ struct raid_drive {
 
 struct raid_bdev {
 	struct spdk_bdev	bdev;
-	int raid_level;
+	int parity_level;
 	int num_drives;
+	int num_parity;
+	int num_data_drives_healthy;
+	int num_faulty_drives;
+	int drive_status[RAID_DRIVES_MAX];
 	unsigned int stripe_size_blks;
 	unsigned int stripe_size_bytes;
 	int parity_size_bytes;
 	int parity_size_blks;
 	struct raid_drive drives[RAID_DRIVES_MAX];
 	int ec_fd;
+
+	struct {
+		unsigned char *encode_matrix;
+		unsigned char *decode_matrix;
+		unsigned char *invert_matrix;
+		unsigned char *g_tables;
+	} ec;
+
+	struct {
+		uint64_t num_reads, num_writes;
+		uint64_t num_bytes_read, num_bytes_write;
+		uint64_t read_time, write_time;
+	} stats;
+
 	TAILQ_ENTRY(raid_bdev)	tailq;
 };
 
@@ -77,6 +96,12 @@ struct raid_io_channel {
 	struct spdk_poller		*poller;
 	TAILQ_HEAD(, spdk_bdev_io)	io;
 };
+
+
+struct cmd_data {
+	void *task;
+};
+
 
 static TAILQ_HEAD(, raid_bdev) g_raid_bdev_head;
 static void *g_raid_read_buf;
@@ -86,18 +111,27 @@ bdev_raid_destruct(void *ctx)
 {
 	struct raid_bdev *bdev = ctx;
 
+	printf("Stats\n");
+	printf("num_reads: %lu\n", bdev->stats.num_reads);
+	printf("num_writes: %lu\n", bdev->stats.num_writes);
+
 	for (int i = 0; i < bdev->num_drives; i++) {
-			printf("Closing raid drive %d\n", i);
-			if (bdev->drives[i].is_nvme == false) {
+		printf("Closing raid drive %d\n", i);
+		if (bdev->drives[i].is_nvme == false) {
+			if (bdev->drives[i].ch) 
 				spdk_put_io_channel(bdev->drives[i].ch);
-				spdk_bdev_close(bdev->drives[i].desc);
-			} else {
-				spdk_put_io_channel(bdev->drives[i].ch);
-				printf("Skiping close for nvme drive %s\n", bdev->drives[i].name);
-			}
+			spdk_bdev_close(bdev->drives[i].desc);
+		} else {
+			spdk_put_io_channel(bdev->drives[i].ch);
+			printf("Skiping close for nvme drive %s\n", bdev->drives[i].name);
 		}
+	}
 
 	TAILQ_REMOVE(&g_raid_bdev_head, bdev, tailq);
+	free(bdev->ec.encode_matrix);
+	free(bdev->ec.decode_matrix);
+	free(bdev->ec.invert_matrix);
+	free(bdev->ec.g_tables);
 	free(bdev->bdev.name);
 	spdk_dma_free(bdev);
 
@@ -111,6 +145,9 @@ struct bdev_raid_read_task {
 	int num_complete;
 	uint64_t stripe_num;
 	uint64_t dev_num;
+
+	uint8_t  err_list[RAID_DRIVES_MAX];
+	char **enc_data;
 };
 
 static void
@@ -119,23 +156,97 @@ bdev_raid_read_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 	struct bdev_raid_read_task *task = cb_arg;
 
 	task->num_complete++;
-	//printf("task->num_issued %d complete %d crc %d\n",
-			//task->num_issued, task->num_complete, crc32_ieee(0, bdev_io->u.bdev.iovs[0].iov_base, 512));
 	if (task->num_issued == task->num_complete) {
 		spdk_bdev_io_complete(task->parent_io_cmd, bdev_io->status);
-
-		 //TAILQ_INSERT_TAIL(&task->parent_io_channel->io, task->parent_io_cmd,
-		//	module_link);
-		spdk_dma_free(task);
+		free(task);
 	}
 	spdk_bdev_free_io(bdev_io);
 }
 
+#define MMAX RAID_DRIVES_MAX
+#define KMAX RAID_DRIVES_MAX
+#define TEST_SOURCES RAID_DRIVES_MAX
+
+static void
+bdev_raid_read_rec_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
+{
+	struct cmd_data *cmd_data = cb_arg;
+	struct bdev_raid_read_task *task = cmd_data->task;
+
+	task->num_complete++;
+
+	//printf("issued %d complete %d\n", task->num_issued, task->num_complete);
+
+	if (task->num_issued == task->num_complete) {
+        	uint8_t *a, b[MMAX * KMAX], c[MMAX * KMAX], d[MMAX * KMAX];
+        	uint8_t g_tbls[KMAX * KMAX * 32];
+        	uint8_t src_err_list[TEST_SOURCES], *recov[TEST_SOURCES], *src_in_err;
+		struct raid_bdev *rbdev = SPDK_CONTAINEROF(task->parent_io_cmd->bdev,
+				struct raid_bdev, bdev);
+		int k = rbdev->num_drives - rbdev->num_parity;
+		int i, r, j, nerrs = (rbdev->num_drives - rbdev->num_parity) - rbdev->num_data_drives_healthy;
+		int r_idx = 0;
+		uint8_t *temp_buffs[KMAX];
+
+		src_in_err = task->err_list;
+		a = rbdev->ec.encode_matrix;
+
+		// Recover data
+
+		for (i = 0, r = 0; i < k; i++) {
+			if (task->err_list[i]) {
+				src_err_list[r++] = i;
+			}
+		}
+
+                for (i = 0, r = 0; i < k; i++, r++) {
+                        while (src_in_err[r]) {
+				temp_buffs[r_idx] = task->enc_data[r];
+                                r++;
+				r_idx++;
+			}
+                        recov[i] = task->enc_data[r];
+                        for (j = 0; j < k; j++)
+                                b[k * i + j] = a[k * r + j];
+                }
+
+                if (gf_invert_matrix(b, d, k) < 0) {
+                        printf("BAD MATRIX\n");
+			exit(-1);
+                }
+
+                for (i = 0; i < nerrs; i++)
+                        for (j = 0; j < k; j++)
+                                c[k * i + j] = d[k * src_err_list[i] + j];
+
+                // Recover data
+                ec_init_tables(k, nerrs, c, g_tbls);
+                ec_encode_data(rbdev->bdev.blocklen, k, nerrs, g_tbls, recov, temp_buffs);
+		spdk_bdev_io_complete(task->parent_io_cmd, bdev_io->status);
+		//spdk_dma_free(task->enc_data[rbdev->num_drives - 1]);
+		//spdk_dma_free(task->enc_data[rbdev->num_drives - 2]);
+		
+		for (int parity_idx = rbdev->num_drives - rbdev->num_parity;
+				parity_idx < rbdev->num_drives; parity_idx++) {
+			free(task->enc_data[parity_idx]);
+		}
+		free(task->enc_data);
+		free(task);
+	}
+
+	free(cmd_data);
+	spdk_bdev_free_io(bdev_io);
+
+}
+
+
 static void
 bdev_raid_read(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-	int i = 0, ret;
+	int i = 0;
 	struct raid_bdev *rbdev = SPDK_CONTAINEROF(bdev_io->bdev, struct raid_bdev, bdev);
+
+	rbdev->stats.num_reads++;
 
 	//printf("bdev_raid_read %lu %lu,\n", bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks);
 	if (bdev_io->u.bdev.offset_blocks + bdev_io->u.bdev.num_blocks >
@@ -145,39 +256,81 @@ bdev_raid_read(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 		return;
 	}
 
-	struct bdev_raid_read_task *task = spdk_dma_malloc(sizeof(*task), 0, NULL);
-	task->parent_io_cmd = bdev_io;
-	task->parent_io_channel = ch;
-	task->num_issued = bdev_io->u.bdev.num_blocks;
-	task->num_complete = 0;
-	struct spdk_thread *th = spdk_get_thread();
-	//printf("read thread %s\n", spdk_thread_get_name(th));
 
-
+		struct bdev_raid_read_task *task = malloc(sizeof(*task));
+		task->parent_io_cmd = bdev_io;
+		task->parent_io_channel = ch;
+		task->num_issued = bdev_io->u.bdev.num_blocks;
+		task->num_complete = 0;
+	
 
 	uint64_t stripe_num, dev_num;
-	switch (rbdev->raid_level) {
-	case 6:
-		for (i = 0; i < bdev_io->u.bdev.num_blocks; i++) {
-			stripe_num = (bdev_io->u.bdev.offset_blocks + i) / rbdev->stripe_size_blks;
-			dev_num = (bdev_io->u.bdev.offset_blocks + i) % rbdev->stripe_size_blks;
+	if (rbdev->num_drives == rbdev->num_data_drives_healthy + rbdev->num_parity) {
 
-			//printf("reading block stripe %lu dev %lu\n", stripe_num, dev_num);
-			ret = spdk_bdev_read_blocks(rbdev->drives[dev_num].desc,
-						rbdev->drives[dev_num].ch,
-						bdev_io->u.bdev.iovs[0].iov_base + (i * rbdev->bdev.blocklen),
-						stripe_num,
-						1,
-						bdev_raid_read_done,
-						task);
+	for (unsigned int i = 0; i < bdev_io->u.bdev.num_blocks; i++) {
+		stripe_num = (bdev_io->u.bdev.offset_blocks + i) / rbdev->stripe_size_blks;
+		dev_num = (bdev_io->u.bdev.offset_blocks + i) % rbdev->stripe_size_blks;
 
-			assert(ret == 0);
-			//printf("ret = %d\n", ret);
+		//printf("reading block stripe %lu dev %lu\n", stripe_num, dev_num);
+		int ret = spdk_bdev_read_blocks(rbdev->drives[dev_num].desc,
+					rbdev->drives[dev_num].ch,
+					bdev_io->u.bdev.iovs[0].iov_base + (i * rbdev->bdev.blocklen),
+					stripe_num,
+					1,
+					bdev_raid_read_done,
+					task);
+		if (ret != 0) {
+			printf("failed to issue read\n");
+			exit(-1);
 		}
-		break;
-	default:
-		assert(0);
-		break;
+
+	}
+	} else {
+		// Construct
+		// No RMW
+		char **enc_data = calloc(rbdev->num_drives, sizeof (char *));
+		//char *enc_parity1 = spdk_dma_malloc(rbdev->bdev.blocklen, 0, NULL);
+		//char *enc_parity2 = spdk_dma_malloc(rbdev->bdev.blocklen, 0, NULL);
+		int to_issue = task->num_issued = rbdev->num_data_drives_healthy + rbdev->num_parity;
+		int issued = 0;
+
+		assert(bdev_io->u.bdev.iovcnt == 1);
+		for (i = 0; i < rbdev->num_drives - rbdev->num_parity; i++) {
+			enc_data[i] = bdev_io->u.bdev.iovs[0].iov_base + (i * rbdev->bdev.blocklen);
+		}
+
+		for (; i < rbdev->num_drives; i++) {
+			enc_data[i] = malloc(rbdev->bdev.blocklen);
+		}
+
+		task->enc_data = enc_data;
+		
+		for (i = 0; i < rbdev->num_drives; i++) {
+			if (rbdev->drive_status[i] != 0) {
+				task->err_list[i] = 1;
+				continue;
+			} else {
+				task->err_list[i] = 0;
+			}
+			uint64_t stripe_num = (bdev_io->u.bdev.offset_blocks)
+				/ rbdev->stripe_size_blks;
+			struct cmd_data *cmd_data = malloc(sizeof *cmd_data);
+			memset(cmd_data, 0, sizeof(*cmd_data));
+			cmd_data->task = task;
+			
+			int ret = spdk_bdev_read_blocks(rbdev->drives[i].desc,
+					rbdev->drives[i].ch,
+					enc_data[i],
+					stripe_num,
+					1,
+					bdev_raid_read_rec_done, cmd_data);
+			if (ret != 0) {
+				printf("Failed to issue read\n");
+				exit(-1);
+			}
+			issued++;
+		}
+		assert(to_issue == issued);
 	}
 }
 
@@ -186,14 +339,10 @@ struct bdev_raid_write_task {
 	int num_complete;
 	struct raid_io_channel *parent_io_channel;
 	struct spdk_bdev_io    *parent_io_cmd;
+
+	unsigned char **enc_data;
 };
 
-
-struct cmd_data {
-	struct bdev_raid_write_task *task;
-	char *buf;
-	bool free_buf;
-};
 
 static void
 bdev_raid_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
@@ -203,32 +352,31 @@ bdev_raid_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 
 	task->num_complete++;
 
-	//printf("num issued %d num complete %d\n", task->num_issued, task->num_complete);
+//	printf("num issued %d num complete %d\n", task->num_issued, task->num_complete);
 
 	if (task->num_issued == task->num_complete) {
-
-	spdk_bdev_io_complete(task->parent_io_cmd, bdev_io->status);
-
-	//TAILQ_INSERT_TAIL(&task->parent_io_channel->io, task->parent_io_cmd,
-	//		module_link);
-
-		spdk_dma_free(task);
+		struct raid_bdev *rbdev = SPDK_CONTAINEROF(task->parent_io_cmd->bdev,
+				struct raid_bdev, bdev);
+		spdk_bdev_io_complete(task->parent_io_cmd, bdev_io->status);
+		for (int parity_idx = rbdev->num_drives - rbdev->num_parity;
+				parity_idx < rbdev->num_drives; parity_idx++) {
+			free(task->enc_data[parity_idx]);
+		}
+		free(task->enc_data);
+		free(task);
 	}
 
-	if (cmd_data->free_buf) {
-		spdk_dma_free(cmd_data->buf);
-	}
-	spdk_dma_free(cmd_data);
+	free(cmd_data);
 	spdk_bdev_free_io(bdev_io);
 }
 
 static void
 bdev_raid_write(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-	int i = 0, ret, j = 0;
-	uint64_t frag_len;
+	int i = 0;
 	struct raid_bdev *rbdev = SPDK_CONTAINEROF(bdev_io->bdev, struct raid_bdev, bdev);
-	
+	int num_to_issue, num_issued = 0;
+	rbdev->stats.num_writes++;
 	
 	if (bdev_io->u.bdev.offset_blocks + bdev_io->u.bdev.num_blocks >
 			rbdev->bdev.blockcnt) {
@@ -236,96 +384,73 @@ bdev_raid_write(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
-	struct bdev_raid_write_task *task = spdk_dma_malloc(sizeof(*task), 0, NULL);
+	struct bdev_raid_write_task *task = malloc(sizeof(*task));
 	task->parent_io_cmd = bdev_io;
-	task->parent_io_channel = ch; 
-	task->num_issued = rbdev->num_drives;
+	task->parent_io_channel = ch;
+       num_to_issue = task->num_issued = rbdev->num_data_drives_healthy + rbdev->num_parity;
 	task->num_complete = 0;
 
 	//printf("Write : offset %lu blocks %lu\n", bdev_io->u.bdev.offset_blocks,
 	//		bdev_io->u.bdev.num_blocks);
 
-	switch (rbdev->raid_level) {
-	case 6:
 		// N Data - 2 parity
-		if (bdev_io->u.bdev.offset_blocks % rbdev->stripe_size_blks == 0 &&
-				bdev_io->u.bdev.num_blocks == rbdev->stripe_size_blks) {
-			// No RMW
-			void **enc_data = spdk_dma_malloc(sizeof (void *) * (rbdev->num_drives), 0, NULL);
-			char *enc_parity1 = spdk_dma_malloc(rbdev->bdev.blocklen, 0, NULL);
-//				memalign(4096, rbdev->bdev.blocklen);
-			char *enc_parity2 = spdk_dma_malloc(rbdev->bdev.blocklen, 0, NULL);
-//			char *enc_parity2 = memalign(4096, rbdev->bdev.blocklen);
-			assert(enc_parity1 && enc_parity2);
+	if (bdev_io->u.bdev.offset_blocks % rbdev->stripe_size_blks == 0 &&
+			bdev_io->u.bdev.num_blocks == rbdev->stripe_size_blks) {
+		// No RMW
+		unsigned char **enc_data = malloc(sizeof (void *) * (rbdev->num_drives));
+		//char *enc_parity1 = spdk_dma_malloc(rbdev->bdev.blocklen, 0, NULL);
+		//char *enc_parity2 = spdk_dma_malloc(rbdev->bdev.blocklen, 0, NULL);
 
-			assert(bdev_io->u.bdev.iovcnt == 1);
-			for (i = 0; i < rbdev->num_drives - 2; i++) {
-				enc_data[i] = bdev_io->u.bdev.iovs[0].iov_base + (i * rbdev->bdev.blocklen);
-			}
-			enc_data[rbdev->num_drives - 2] = enc_parity1;
-			enc_data[rbdev->num_drives - 1] = enc_parity2;
-
-			pq_gen(rbdev->num_drives, rbdev->bdev.blocklen, enc_data);
-
-			for (i = 0; i < rbdev->num_drives; i++) {
-				uint64_t stripe_num = (bdev_io->u.bdev.offset_blocks)
-					/ rbdev->stripe_size_blks;
-				struct cmd_data *cmd_data = spdk_dma_malloc(sizeof *cmd_data, 0, NULL);
-				cmd_data->task = task;
-				if (i == rbdev->num_drives - 2) {
-					cmd_data->buf = enc_parity1;
-					cmd_data->free_buf = true;
-				} else if (i == rbdev->num_drives - 1) {
-					cmd_data->buf = enc_parity2;
-					cmd_data->free_buf = true;
-				}
-				
-				//printf("writing block stripe %lu dev %lu crc %d\n", stripe_num, i,
-				//		crc32_ieee(0, enc_data[i], rbdev->bdev.blocklen));
-				ret = spdk_bdev_write_blocks(rbdev->drives[i].desc,
-						rbdev->drives[i].ch,
-						enc_data[i],
-						stripe_num,
-						1,
-						bdev_raid_write_done, cmd_data);
-				assert(ret == 0);
-			}
-
-		} else {
-			printf("unsupported\n");
-			assert(0);
+		assert(bdev_io->u.bdev.iovcnt == 1);
+		for (i = 0; i < rbdev->num_drives - rbdev->num_parity; i++) {
+			enc_data[i] = bdev_io->u.bdev.iovs[0].iov_base + (i * rbdev->bdev.blocklen);
 		}
-		break;
-	default:
+
+		for (; i < rbdev->num_drives; i++) {
+			enc_data[i] = malloc(rbdev->bdev.blocklen);
+		}
+		
+		ec_encode_data(rbdev->bdev.blocklen, rbdev->num_drives - rbdev->num_parity,
+				rbdev->num_parity, rbdev->ec.g_tables, enc_data,
+				&enc_data[rbdev->num_drives - rbdev->num_parity]);
+
+		task->enc_data = enc_data;
+		for (i = 0; i < rbdev->num_drives; i++) {
+			if (rbdev->drive_status[i] != 0) {
+				continue;
+			}
+			uint64_t stripe_num = (bdev_io->u.bdev.offset_blocks)
+				/ rbdev->stripe_size_blks;
+			struct cmd_data *cmd_data = malloc(sizeof *cmd_data);
+			memset(cmd_data, 0, sizeof(*cmd_data));
+			cmd_data->task = task;
+			
+			//printf("writing block stripe %lu dev %lu crc %d\n", stripe_num, i,
+			//		crc32_ieee(0, enc_data[i], rbdev->bdev.blocklen));
+			int ret = spdk_bdev_write_blocks(rbdev->drives[i].desc,
+					rbdev->drives[i].ch,
+					enc_data[i],
+					stripe_num,
+					1,
+					bdev_raid_write_done, cmd_data);
+			if (ret != 0) {
+				printf("Failed to issue write\n");
+				exit(-1);
+			}
+			num_issued++;
+		}
+		assert(num_issued == num_to_issue);
+
+	} else {
 		printf("unsupported\n");
 		assert(0);
-		break;
 	}
-
-
-						
-
-
-#if 0
-	for (i = 0; i < rbdev->num_drives; i++) {
-		//printf("issuing write to base drive\n");
-		//printf("issuing write to base drive offset %u num_blks %u\n",
-			//	bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks);
-
-		ret = spdk_bdev_writev(rbdev->drives[i].desc, rbdev->drives[i].ch,
-				bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
-				bdev_io->u.bdev.offset_blocks * rbdev->bdev.blocklen,
-				bdev_io->u.bdev.num_blocks * rbdev->bdev.blocklen,
-				bdev_raid_write_done, task);
-		assert(ret == 0);
-	}
-#endif
 }
 
 static void
 bdev_raid_write_zeroes(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
-	int i = 0, ret;
+	int i = 0;
 	struct raid_bdev *rbdev = SPDK_CONTAINEROF(bdev_io->bdev, struct raid_bdev, bdev);
 	
 	
@@ -335,7 +460,7 @@ bdev_raid_write_zeroes(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
 		return;
 	}
-	struct bdev_raid_write_task *task = spdk_dma_malloc(sizeof(*task), 0, NULL);
+	struct bdev_raid_write_task *task = malloc(sizeof(*task));
 	task->parent_io_cmd = bdev_io;
 	task->parent_io_channel = ch; 
 	task->num_issued = rbdev->num_drives;
@@ -344,11 +469,14 @@ bdev_raid_write_zeroes(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 	for (i = 0; i < rbdev->num_drives; i++) {
 		//printf("issuing write zeroes to base drive offset %u num_blks %u\n",
 				//bdev_io->u.bdev.offset_blocks, bdev_io->u.bdev.num_blocks);
-		ret = spdk_bdev_write_zeroes(rbdev->drives[i].desc, rbdev->drives[i].ch,
+		int ret = spdk_bdev_write_zeroes(rbdev->drives[i].desc, rbdev->drives[i].ch,
 				bdev_io->u.bdev.offset_blocks * rbdev->bdev.blocklen,
 				bdev_io->u.bdev.num_blocks * rbdev->bdev.blocklen,
 				bdev_raid_write_done, task);
-		assert(ret == 0);
+		if (ret != 0) {
+			printf("Failed to issue write zeros\n");
+			exit(-1);
+		}
 	}
 }
 
@@ -358,17 +486,11 @@ bdev_raid_submit_request(struct spdk_io_channel *_ch, struct spdk_bdev_io *bdev_
 {
 	struct raid_io_channel *ch = spdk_io_channel_get_ctx(_ch);
 
-	//printf("Got command bdev_raid_submit_request\n");
 	switch (bdev_io->type) {
 	case SPDK_BDEV_IO_TYPE_READ:
-	//	SPDK_NOTICELOG("Submitted read request\n");
 		if (bdev_io->u.bdev.iovs[0].iov_base == NULL) {
 			spdk_bdev_io_get_buf(bdev_io, bdev_raid_read,
 				     bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen);
-
-//			assert(bdev_io->u.bdev.iovcnt == 1);
-//			bdev_io->u.bdev.iovs[0].iov_base = g_raid_read_buf;
-//			bdev_io->u.bdev.iovs[0].iov_len = bdev_io->u.bdev.num_blocks * bdev_io->bdev->blocklen;
 		} else {
 			bdev_raid_read(ch, bdev_io);
 		}
@@ -432,10 +554,12 @@ static const struct spdk_bdev_fn_table raid_fn_table = {
 
 struct spdk_bdev *
 create_raid_bdev(const char *name, uint64_t num_blocks, uint32_t block_size,
-		int raid_level, int num_drives, const char **drives)
+		int parity_level, int num_drives, const char **drives,
+		int num_faults, int *faulty_drives)
 {
 	struct raid_bdev *bdev;
-	int rc;
+	int rc, fault_idx = 0;
+	int num_parity;
 
 	if (block_size % 512 != 0) {
 		SPDK_ERRLOG("Block size %u is not a multiple of 512.\n", block_size);
@@ -455,24 +579,41 @@ create_raid_bdev(const char *name, uint64_t num_blocks, uint32_t block_size,
 	}
 
 
-	switch (raid_level) {
-		case 6:
-#if 0
-			ec_args.k = num_drives - 2;
-			ec_args.m = 2;
-			ec_args.w = 16;
-			ec_args.hd = 2;
-			ec_args.ct = CHKSUM_NONE;
-#endif
-			bdev->stripe_size_blks = num_drives - 2;
-			bdev->stripe_size_bytes = (num_drives - 2) * block_size;
-			bdev->parity_size_bytes = 2 * block_size;
-			bdev->parity_size_blks = 2;
-			break;
-		default:
-			assert(0);
-			break;
+	if (parity_level > 0 && parity_level <= 3) {
+		bdev->num_parity = parity_level;
+		num_parity = parity_level;
+	} else {
+		printf("Unsupported");
+		exit(-1);
 	}
+
+	int m = num_drives;
+	int k = num_drives - num_parity;
+	unsigned char *encode_matrix = malloc(m * k);
+	unsigned char *decode_matrix = malloc(m * k);
+	unsigned char *invert_matrix = malloc(m * k);
+	unsigned char *g_tables = malloc(m * k * 32);
+
+	if (encode_matrix == NULL ||
+			decode_matrix == NULL ||
+			invert_matrix == NULL ||
+			g_tables == NULL ) {
+		printf("failed to allocate memory");
+		exit(-1);
+	}
+
+	gf_gen_rs_matrix(encode_matrix, m, k);
+	ec_init_tables(k, m - k, &encode_matrix[k * k], g_tables);
+
+	bdev->ec.encode_matrix = encode_matrix;
+	bdev->ec.decode_matrix = decode_matrix;
+	bdev->ec.invert_matrix = invert_matrix;
+	bdev->ec.g_tables = g_tables;
+	bdev->stripe_size_blks = num_drives - num_parity;
+	bdev->stripe_size_bytes = (num_drives - num_parity) * block_size;
+	bdev->parity_size_bytes = num_parity * block_size;
+	bdev->parity_size_blks = num_parity;
+	bdev->num_data_drives_healthy = num_drives - num_parity - num_faults;
 
 	bdev->bdev.name = strdup(name);
 	if (!bdev->bdev.name) {
@@ -488,8 +629,6 @@ create_raid_bdev(const char *name, uint64_t num_blocks, uint32_t block_size,
 	bdev->bdev.ctxt = bdev;
 	bdev->bdev.fn_table = &raid_fn_table;
 	bdev->bdev.module = SPDK_GET_BDEV_MODULE(raid);
-	struct spdk_thread *th = spdk_get_thread();
-	printf("raid thread %s\n", spdk_thread_get_name(th));
 
 	for (int i = 0; i < num_drives; i++) {
 		// Find the Drive
@@ -518,13 +657,26 @@ create_raid_bdev(const char *name, uint64_t num_blocks, uint32_t block_size,
 			break;
 		}
 		strcpy(bdev->drives[i].name, drives[i]);
-//		bdev->drives[i].ch = spdk_bdev_get_io_channel(bdev->drives[i].desc);
+		bdev->drives[i].ch = NULL;
+		if (i == faulty_drives[fault_idx]) {
+			printf("Marking drive %d as faulty\n", i);
+			bdev->drive_status[i] = 1;
+			fault_idx++;
+		} else {
+			bdev->drive_status[i] = 0;
+		}
 	}
 
 	bdev->num_drives = num_drives;
-	bdev->raid_level = raid_level;
+	bdev->parity_level = parity_level;
+	bdev->num_faulty_drives = num_faults;
 
 
+	printf("Create RAID Device: Name %s\n", bdev->bdev.name);
+	printf("Create RAID Device: Level %d\n", bdev->parity_level);
+	printf("Create RAID Device: Drives %d\n", bdev->num_drives);
+	printf("Create RAID Device: Faulty Drives %d\n", bdev->num_faulty_drives);
+	printf("Create RAID Device: Healthy Data Drives %d\n", bdev->num_data_drives_healthy);
 
 	rc = spdk_bdev_register(&bdev->bdev);
 	if (rc) {
@@ -551,7 +703,6 @@ raid_io_poll(void *arg)
 	while (!TAILQ_EMPTY(&io)) {
 		bdev_io = TAILQ_FIRST(&io);
 		TAILQ_REMOVE(&io, bdev_io, module_link);
-//		SPDK_NOTICELOG("Completed request %d\n", bdev_io->type);
 		spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
 	}
 }
@@ -584,8 +735,14 @@ bdev_raid_initialize(void)
 	int block_size = 0, i, rc = 0;
 	struct spdk_bdev *bdev;
 	const char *name = NULL, *val;
-	int num_drives = 0, raid_level = -1;
+	int num_drives = 0, parity_level = -1;
 	const char *drives[RAID_DRIVES_MAX];
+	int faulty_drives[RAID_DRIVES_MAX];
+	int num_faults = 0;
+
+	for (i = 0; i < RAID_DRIVES_MAX; i++) {
+		faulty_drives[i] = -1;
+	}
 
 	printf("Finding Raid Disks\n");
 
@@ -610,97 +767,132 @@ bdev_raid_initialize(void)
 	}
 
 	i = 0;
-	while (i < 2) {
-		val = spdk_conf_section_get_nval(sp, "Dev", i);
-		if (val != NULL) {
-			name = spdk_conf_section_get_nmval(sp, "Dev", i, 0);
-			if (name == NULL) {
-				SPDK_ERRLOG("Raid entry %d: Name must be provided\n", i);
-				continue;
-			}
+	if ((val = spdk_conf_section_get_nval(sp, "Dev", 0)) != NULL) {
+		name = spdk_conf_section_get_nmval(sp, "Dev", i, 0);
+		if (name == NULL) {
+			SPDK_ERRLOG("Raid entry %d: Name must be provided\n", i);
+		}
 
-			val = spdk_conf_section_get_nmval(sp, "Dev", i, 1);
-			if (val == NULL) {
-				SPDK_ERRLOG("Raid entry %d: Size in MB must be provided\n", i);
-				continue;
-			}
+		val = spdk_conf_section_get_nmval(sp, "Dev", i, 1);
+		if (val == NULL) {
+			SPDK_ERRLOG("Raid entry %d: Size in MB must be provided\n", i);
+		}
 
-			errno = 0;
-			size_in_mb = strtoull(val, NULL, 10);
-			if (errno) {
-				SPDK_ERRLOG("Raid entry %d: Invalid size in MB %s\n", i, val);
-				continue;
-			}
+		errno = 0;
+		size_in_mb = strtoull(val, NULL, 10);
+		if (errno) {
+			SPDK_ERRLOG("Raid entry %d: Invalid size in MB %s\n", i, val);
+		}
 
-			val = spdk_conf_section_get_nmval(sp, "Dev", i, 2);
-			if (val == NULL) {
-				block_size = 512;
-			} else {
-				errno = 0;
-				block_size = (int)strtol(val, NULL, 10);
-				if (errno) {
-					SPDK_ERRLOG("Raid entry %d: Invalid block size %s\n", i, val);
-					continue;
-				}
-			}
-
-			num_blocks = size_in_mb * (1024 * 1024) / block_size;
-
+		val = spdk_conf_section_get_nmval(sp, "Dev", i, 2);
+		if (val == NULL) {
+			block_size = 512;
 		} else {
-			val = spdk_conf_section_get_nval(sp, "Base", 0);
-
-			if (val != NULL) {
-				val = spdk_conf_section_get_nmval(sp, "Base", 0, 0);
-				if (val == NULL) {
-					printf("Raid level not provided");
-					rc = EINVAL;
-					goto end;
-				} else {
-					errno = 0;
-					raid_level = (int)strtol(val, NULL, 10);
-					if (errno) {
-						SPDK_ERRLOG("Raid entry %d: Invalid Raid level %s\n", i, val);
-						rc = EINVAL;
-						goto end;
-					}
-
-					printf("Raid Level %d\n", raid_level);
-				}
-
-				val = spdk_conf_section_get_nmval(sp, "Base", 0, 1);
-				if (val == NULL) {
-					printf("Number of Drives not provided");
-					rc = EINVAL;
-					goto end;
-				} else {
-					errno = 0;
-					num_drives = (int)strtol(val, NULL, 10);
-					if (errno) {
-						SPDK_ERRLOG("Raid entry %d: Invalid Number of drive %s\n", i, val);
-						rc = EINVAL;
-						goto end;
-					}
-					printf("Number of Drives in the RAID Group %d\n", num_drives);
-				}
-
-				for (int j = 0; j < num_drives; j++) {
-					val = spdk_conf_section_get_nmval(sp, "Base", 0, 2 + j);
-					if (val == NULL) {
-						printf("Drive name not provided");
-						rc = EINVAL;
-						goto end;
-					} else {
-						errno = 0;
-						drives[j] = val;
-					}
-				}
-			} else {
-				break;
+			errno = 0;
+			block_size = (int)strtol(val, NULL, 10);
+			if (errno) {
+				SPDK_ERRLOG("Raid entry %d: Invalid block size %s\n", i, val);
+				rc = EINVAL;
+				goto end;
 			}
 		}
 
-		printf("i = %d \n", i);
-		i++;
+		num_blocks = size_in_mb * (1024 * 1024) / block_size;
+		printf("Dev %d\n", i);
+	} else {
+		printf("Dev config not provided\n");
+		exit(-1);
+	}
+
+	if ((val = spdk_conf_section_get_nval(sp, "Base", 0)) != NULL) {
+
+		val = spdk_conf_section_get_nmval(sp, "Base", 0, 0);
+		if (val == NULL) {
+			printf("Raid level not provided");
+			rc = EINVAL;
+			goto err;
+		} else {
+			errno = 0;
+			parity_level = (int)strtol(val, NULL, 10);
+			if (errno) {
+				SPDK_ERRLOG("Raid entry %d: Invalid Raid level %s\n", i, val);
+				rc = EINVAL;
+				goto err;
+			}
+
+			printf("parity Level %d\n", parity_level);
+		}
+
+		val = spdk_conf_section_get_nmval(sp, "Base", 0, 1);
+		if (val == NULL) {
+			printf("Number of Drives not provided");
+			rc = EINVAL;
+			goto err;
+		} else {
+			errno = 0;
+			num_drives = (int)strtol(val, NULL, 10);
+			if (errno) {
+				SPDK_ERRLOG("Raid entry %d: Invalid Number of drive %s\n", i, val);
+				rc = EINVAL;
+				goto err;
+			}
+			printf("Number of Drives in the RAID Group %d\n", num_drives);
+		}
+
+		for (int j = 0; j < num_drives; j++) {
+			val = spdk_conf_section_get_nmval(sp, "Base", 0, 2 + j);
+			if (val == NULL) {
+				printf("Drive name not provided");
+				rc = EINVAL;
+				goto err;
+			} else {
+				errno = 0;
+				drives[j] = val;
+			}
+		}
+	} else {
+		printf("Base config not provided\n");
+		exit(-1);
+	}
+
+	if ((val = spdk_conf_section_get_nval(sp, "Fault", 0)) != NULL) {
+		val = spdk_conf_section_get_nmval(sp, "Fault", 0, 0);
+		if (val == NULL) {
+			printf("Num faulty drives not provided");
+			rc = EINVAL;
+			goto err;
+		} else {
+			errno = 0;
+			num_faults = (int)strtol(val, NULL, 10);
+			if (errno) {
+				SPDK_ERRLOG("Raid entry %d: Invalid fault %s\n", i, val);
+				rc = EINVAL;
+				goto err;
+			}
+
+			printf("Num Faulty Drives %d\n", num_faults);
+		}
+
+		int k = 0;
+		for (int j = 0; j < num_faults; j++) {
+			val = spdk_conf_section_get_nmval(sp, "Fault", 0, 1 + j);
+			if (val == NULL) {
+				printf("Drive num not provided");
+				rc = EINVAL;
+				goto err;
+			} else {
+				errno = 0;
+				faulty_drives[k] = (int)strtol(val, NULL, 10);
+				k++;
+				if (errno) {
+					SPDK_ERRLOG("Raid entry %d: Invalid fault %s\n", i, val);
+					rc = EINVAL;
+					goto err;
+				}
+			}
+		}
+	} else {
+		printf("Fault config not provided\n");
 	}
 
 
@@ -708,15 +900,18 @@ bdev_raid_initialize(void)
 		printf("Raid group Drive[%d] %s\n", i, drives[i]);
 	}
 
-	bdev = create_raid_bdev(name, num_blocks, block_size, raid_level, num_drives, drives);
+	bdev = create_raid_bdev(name, num_blocks, block_size, parity_level, num_drives, drives, num_faults, faulty_drives);
 	if (bdev == NULL) {
 		SPDK_ERRLOG("Could not create raid bdev\n");
 		rc = EINVAL;
-		goto end;
+		goto err;
 	}
 
 end:
 	return rc;
+
+err:
+	exit(-1);
 }
 
 static void

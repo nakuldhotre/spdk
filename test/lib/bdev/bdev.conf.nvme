@@ -1,0 +1,10 @@
+[Nvme]
+  TransportID "trtype:PCIe traddr:0000:00:0e.0" Nvme0
+[Malloc]
+   NumberOfLuns 6
+   LunSizeInMB 64
+   BlockSize 4096
+[Raid]
+	Dev Raid0 64 4096
+	Base 6 6 Malloc0 Malloc1 Malloc2 Malloc3 Malloc4 Malloc5
+	Fault 2 0 2

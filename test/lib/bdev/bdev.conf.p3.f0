@@ -5,4 +5,4 @@
 [Raid]
 	Dev Raid0 64 4096
 	Base 3 7 Malloc0 Malloc1 Malloc2 Malloc3 Malloc4 Malloc5 Malloc6
-	Fault 1 0 
+	Fault 0 
