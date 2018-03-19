@@ -2,14 +2,14 @@
 ioengine=spdk_bdev
 spdk_conf=/home/nakul/projects/spdk/test/lib/bdev/bdev.conf
 #/home/nakul/projects/spdk/examples/bdev/fio_plugin/bdev.conf.in
-thread=4
+thread=1
 group_reporting=1
 direct=1
 verify=0
 time_based=1
 ramp_time=0
 runtime=10
-iodepth=1
+iodepth=16
 rw=rw
 bs=16384
 filename=Raid0

@@ -63,6 +63,7 @@ struct raid_drive {
 
 struct raid_bdev {
 	struct spdk_bdev	bdev;
+	struct spdk_mempool *mempool;
 	int parity_level;
 	int num_drives;
 	int num_parity;
@@ -133,6 +134,7 @@ bdev_raid_destruct(void *ctx)
 	free(bdev->ec.invert_matrix);
 	free(bdev->ec.g_tables);
 	free(bdev->bdev.name);
+	spdk_mempool_free(bdev->mempool);
 	spdk_dma_free(bdev);
 
 	return 0;
@@ -225,11 +227,19 @@ bdev_raid_read_rec_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg
 		spdk_bdev_io_complete(task->parent_io_cmd, bdev_io->status);
 		//spdk_dma_free(task->enc_data[rbdev->num_drives - 1]);
 		//spdk_dma_free(task->enc_data[rbdev->num_drives - 2]);
-		
+
+/*		
 		for (int parity_idx = rbdev->num_drives - rbdev->num_parity;
 				parity_idx < rbdev->num_drives; parity_idx++) {
 			free(task->enc_data[parity_idx]);
 		}
+		*/
+		if (rbdev->num_parity) {
+			spdk_mempool_put(rbdev->mempool,
+					task->enc_data[rbdev->num_drives - rbdev->num_parity]);
+			//free(task->enc_data[rbdev->num_drives - rbdev->num_parity]);
+		}
+
 		free(task->enc_data);
 		free(task);
 	}
@@ -256,17 +266,16 @@ bdev_raid_read(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 		return;
 	}
 
-
-		struct bdev_raid_read_task *task = malloc(sizeof(*task));
-		task->parent_io_cmd = bdev_io;
-		task->parent_io_channel = ch;
-		task->num_issued = bdev_io->u.bdev.num_blocks;
-		task->num_complete = 0;
-	
-
+	struct bdev_raid_read_task *task = malloc(sizeof(*task));
 	uint64_t stripe_num, dev_num;
-	if (rbdev->num_drives == rbdev->num_data_drives_healthy + rbdev->num_parity) {
+	task->parent_io_cmd = bdev_io;
+	task->parent_io_channel = ch;
+	task->num_issued = bdev_io->u.bdev.num_blocks;
+	task->num_complete = 0;
 
+
+	if (rbdev->num_drives == rbdev->num_data_drives_healthy + rbdev->num_parity) {
+	// No failed drive
 	for (unsigned int i = 0; i < bdev_io->u.bdev.num_blocks; i++) {
 		stripe_num = (bdev_io->u.bdev.offset_blocks + i) / rbdev->stripe_size_blks;
 		dev_num = (bdev_io->u.bdev.offset_blocks + i) % rbdev->stripe_size_blks;
@@ -299,8 +308,16 @@ bdev_raid_read(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 			enc_data[i] = bdev_io->u.bdev.iovs[0].iov_base + (i * rbdev->bdev.blocklen);
 		}
 
+		unsigned char *parity_buf = NULL;
+		
+		if (rbdev->num_parity) {
+			//parity_buf = malloc(rbdev->parity_size_bytes);
+			parity_buf = spdk_mempool_get(rbdev->mempool);	
+		}
+
 		for (; i < rbdev->num_drives; i++) {
-			enc_data[i] = malloc(rbdev->bdev.blocklen);
+			enc_data[i] = parity_buf;
+			parity_buf+= rbdev->bdev.blocklen;
 		}
 
 		task->enc_data = enc_data;
@@ -339,7 +356,6 @@ struct bdev_raid_write_task {
 	int num_complete;
 	struct raid_io_channel *parent_io_channel;
 	struct spdk_bdev_io    *parent_io_cmd;
-
 	unsigned char **enc_data;
 };
 
@@ -358,10 +374,18 @@ bdev_raid_write_done(struct spdk_bdev_io *bdev_io, bool success, void *cb_arg)
 		struct raid_bdev *rbdev = SPDK_CONTAINEROF(task->parent_io_cmd->bdev,
 				struct raid_bdev, bdev);
 		spdk_bdev_io_complete(task->parent_io_cmd, bdev_io->status);
+		/*
 		for (int parity_idx = rbdev->num_drives - rbdev->num_parity;
 				parity_idx < rbdev->num_drives; parity_idx++) {
 			free(task->enc_data[parity_idx]);
+		}*/
+
+		if (rbdev->num_parity) {
+			spdk_mempool_put(rbdev->mempool,
+					task->enc_data[rbdev->num_drives - rbdev->num_parity]);
+			//free(task->enc_data[rbdev->num_drives - rbdev->num_parity]);
 		}
+
 		free(task->enc_data);
 		free(task);
 	}
@@ -387,7 +411,7 @@ bdev_raid_write(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 	struct bdev_raid_write_task *task = malloc(sizeof(*task));
 	task->parent_io_cmd = bdev_io;
 	task->parent_io_channel = ch;
-       num_to_issue = task->num_issued = rbdev->num_data_drives_healthy + rbdev->num_parity;
+        num_to_issue = task->num_issued = rbdev->num_data_drives_healthy + rbdev->num_parity;
 	task->num_complete = 0;
 
 	//printf("Write : offset %lu blocks %lu\n", bdev_io->u.bdev.offset_blocks,
@@ -406,8 +430,15 @@ bdev_raid_write(struct raid_io_channel *ch, struct spdk_bdev_io *bdev_io)
 			enc_data[i] = bdev_io->u.bdev.iovs[0].iov_base + (i * rbdev->bdev.blocklen);
 		}
 
+		unsigned char *parity_buf = NULL; 
+		if (rbdev->num_parity) {
+			//parity_buf = malloc(rbdev->parity_size_bytes);
+			parity_buf = spdk_mempool_get(rbdev->mempool);
+		}
+
 		for (; i < rbdev->num_drives; i++) {
-			enc_data[i] = malloc(rbdev->bdev.blocklen);
+			enc_data[i] = parity_buf;
+			parity_buf += rbdev->bdev.blocklen;
 		}
 		
 		ec_encode_data(rbdev->bdev.blocklen, rbdev->num_drives - rbdev->num_parity,
@@ -579,7 +610,7 @@ create_raid_bdev(const char *name, uint64_t num_blocks, uint32_t block_size,
 	}
 
 
-	if (parity_level > 0 && parity_level <= 3) {
+	if (parity_level >= 0 && parity_level <= 3) {
 		bdev->num_parity = parity_level;
 		num_parity = parity_level;
 	} else {
@@ -614,6 +645,10 @@ create_raid_bdev(const char *name, uint64_t num_blocks, uint32_t block_size,
 	bdev->parity_size_bytes = num_parity * block_size;
 	bdev->parity_size_blks = num_parity;
 	bdev->num_data_drives_healthy = num_drives - num_parity - num_faults;
+
+	bdev->mempool = spdk_mempool_create("raid_mempool", 128,
+			bdev->parity_size_bytes, SPDK_MEMPOOL_DEFAULT_CACHE_SIZE,
+			SPDK_ENV_SOCKET_ID_ANY);
 
 	bdev->bdev.name = strdup(name);
 	if (!bdev->bdev.name) {

@@ -1,0 +1,8 @@
+[Malloc]
+   NumberOfLuns 7
+   LunSizeInMB 64
+   BlockSize 4096
+[Raid]
+	Dev Raid0 64 4096
+	Base 1 5 Malloc0 Malloc1 Malloc2 Malloc3 Malloc4 Malloc5 Malloc6
+	Fault 1 0  
